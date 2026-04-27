@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -72,45 +73,45 @@ def middle(text, limit):
 ##############################
 #### 1) Live Repo Context ####
 ##############################
-class WorkspaceContext:
+class WorkspaceContext: #在 agent 启动时，把仓库环境拍一张快照，存成一个对象，随时能序列化成 LLM 可读的文本，塞进 prompt 的静态前缀里。
     def __init__(self, cwd, repo_root, branch, default_branch, status, recent_commits, project_docs):
-        self.cwd = cwd
+        self.cwd = cwd #用户传的工作目录字符串
         self.repo_root = repo_root
-        self.branch = branch
-        self.default_branch = default_branch
+        self.branch = branch #当前分支
+        self.default_branch = default_branch #默认分支，origin/main或者origin/master
         self.status = status
         self.recent_commits = recent_commits
         self.project_docs = project_docs
 
     @classmethod
     def build(cls, cwd):
-        cwd = Path(cwd).resolve()
+        cwd = Path(cwd).resolve() #.resolve()把路径转换成绝对路径，去掉符号链接，..等
 
-        def git(args, fallback=""):
+        def git(args, fallback=""): #跑一条 git 命令，失败了就返回 fallback，不抛异常
             try:
                 result = subprocess.run(
-                    ["git", *args],
+                    ["git", *args], #实际跑的命令是 git + args 列表
                     cwd=cwd,
-                    capture_output=True,
-                    text=True,
-                    check=True,
+                    capture_output=True, #捕获stdout和stderr
+                    text=True,#返回的是字符串而不是bytes
+                    check=True,#退出码指的是每个程序运行结束的时候，会向操作系统返回一个整数，这个整数是退出码，通常0表示成功，非0表示失败。check=True参数会让subprocess.run在命令返回非0退出码时抛出异常CalledProcessError。
                     timeout=5,
                 )
                 return result.stdout.strip() or fallback
             except Exception:
                 return fallback
 
-        repo_root = Path(git(["rev-parse", "--show-toplevel"], str(cwd))).resolve()
+        repo_root = Path(git(["rev-parse", "--show-toplevel"], str(cwd))).resolve() #--show-toplevel意思是返回当前仓库的最顶层目录绝对路径，rev-parse是一个底层子命令，show-toplevel是它的参数
         docs = {}
         for base in (repo_root, cwd):
             for name in DOC_NAMES:
                 path = base / name
                 if not path.exists():
                     continue
-                key = str(path.relative_to(repo_root))
+                key = str(path.relative_to(repo_root)) #把绝对路径转成相对于repo_root的路径字符串
                 if key in docs:
                     continue
-                docs[key] = clip(path.read_text(encoding="utf-8", errors="replace"), 1200)
+                docs[key] = clip(path.read_text(encoding="utf-8", errors="replace"), 1200) #把文件内容读出来，剪裁成最多1200字符的字符串
 
         return cls(
             cwd=str(cwd),
@@ -122,7 +123,7 @@ class WorkspaceContext:
             project_docs=docs,
         )
 
-    def text(self):
+    def text(self): #序列化给llm看的字符串，包含工作目录、git状态、最近的提交信息、项目文档等
         commits = "\n".join(f"- {line}" for line in self.recent_commits) or "- none"
         docs = "\n".join(f"- {path}\n{snippet}" for path, snippet in self.project_docs.items()) or "- none"
         return "\n".join([
@@ -143,17 +144,17 @@ class WorkspaceContext:
 ##############################
 #### 5) Session Memory #######
 ##############################
-class SessionStore:
+class SessionStore:#一个json文件的读写管理器，每个会话对应一个json文件，文件名是session_id.json。把session对象（一个大dict）存到磁盘，从磁盘读出来，找出最新的那个。
     def __init__(self, root):
         self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, exist_ok=True) #没有中间父目录就自动创建，如果目录已经存在不报错
 
     def path(self, session_id):
         return self.root / f"{session_id}.json"
 
     def save(self, session):
         path = self.path(session["id"])
-        path.write_text(json.dumps(session, indent=2), encoding="utf-8")
+        path.write_text(json.dumps(session, indent=2), encoding="utf-8") #每次都是整个文件从写入，覆盖原来的内容
         return path
 
     def load(self, session_id):
@@ -164,7 +165,7 @@ class SessionStore:
         return files[-1].stem if files else None
 
 
-class FakeModelClient:
+class FakeModelClient: #写测试时你不想真的调 Ollama（慢、要钱、不稳定）。你只想测"agent 拿到模型某种输出后，行为对不对"
     def __init__(self, outputs):
         self.outputs = list(outputs)
         self.prompts = []
@@ -176,36 +177,36 @@ class FakeModelClient:
         return self.outputs.pop(0)
 
 
-class OllamaModelClient:
+class OllamaModelClient: #是llm.py的部分，真正llm调用api的部分，让agent正常运行，把prompt字符串变成llm输出字符串
     def __init__(self, model, host, temperature, top_p, timeout):
         self.model = model
-        self.host = host.rstrip("/")
+        self.host = host.rstrip("/") #Ollama 服务器跑在哪，默认是 http://localhost:11434，rstrip("/")是为了防止用户输入"http://localhost:11434/"这种带斜杠的地址导致后面拼接路径出问题
         self.temperature = temperature
         self.top_p = top_p
         self.timeout = timeout
 
     def complete(self, prompt, max_new_tokens):
-        payload = {
+        payload = { #我们要把它变成 JSON 发给 Ollama 服务器，告诉它"我想要这样生成"。
             "model": self.model,
             "prompt": prompt,
-            "stream": False,
-            "raw": False,
-            "think": False,
+            "stream": False,#ollama生成完整文本一次性返回给你，true是变生成边发
+            "raw": False, #让ollama帮我加上模型自己的对话模板，比如"assistant说了什么"，"tool调用了什么"，如果是true我就得自己解析这些东西，false的话ollama帮我把它们都去掉了，我直接拿到纯文本就行
+            "think": False, #不要think模式，直接给答案
             "options": {
                 "num_predict": max_new_tokens,
                 "temperature": self.temperature,
                 "top_p": self.top_p,
             },
         }
-        request = urllib.request.Request(
-            self.host + "/api/generate",
-            data=json.dumps(payload).encode("utf-8"),
+        request = urllib.request.Request( # Ollama 的"生成文本"接口路径
+            self.host + "/api/generate",#生成文本的接口地址是 /api/generate，ollama服务器默认跑在http://localhost:11434，所以完整地址就是http://localhost:11434/api/generate
+            data=json.dumps(payload).encode("utf-8"), #把上面的payload字典变成json字符串，再编码成utf-8字节串，作为http请求的body
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
+                data = json.loads(response.read().decode("utf-8")) 
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"Ollama request failed with HTTP {exc.code}: {body}") from exc
@@ -220,6 +221,50 @@ class OllamaModelClient:
         if data.get("error"):
             raise RuntimeError(f"Ollama error: {data['error']}")
         return data.get("response", "")
+
+
+class OpenRouterModelClient:
+    def __init__(self, model, api_key, host, temperature, top_p, timeout):
+        self.model = model
+        self.api_key = api_key
+        self.host = host.rstrip("/")
+        self.temperature = temperature
+        self.top_p = top_p
+        self.timeout = timeout
+
+    def complete(self, prompt, max_new_tokens):
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_new_tokens,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+        }
+        request = urllib.request.Request(
+            self.host + "/api/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"OpenRouter request failed with HTTP {exc.code}: {body}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                "Could not reach OpenRouter.\n"
+                f"Host: {self.host}\n"
+                f"Model: {self.model}"
+            ) from exc
+
+        if data.get("error"):
+            raise RuntimeError(f"OpenRouter error: {data['error']}")
+        return data["choices"][0]["message"]["content"]
 
 
 class MiniAgent:
@@ -494,27 +539,27 @@ class MiniAgent:
     #### 3) Structured Tools, Validation, And Permissions #######
     #############################################################
     def run_tool(self, name, args):
-        tool = self.tools.get(name)
-        if tool is None:
+        tool = self.tools.get(name) 
+        if tool is None: #如果模型想调一个不存在的工具，直接返回错误信息，不要让它继续瞎折腾了
             return f"error: unknown tool '{name}'"
         try:
-            self.validate_tool(name, args)
+            self.validate_tool(name, args)#按照工具类型校验参数是否合法，如果不合法就抛异常，告诉模型它哪里搞错了，顺便给个示例正确调用格式
         except Exception as exc:
             example = self.tool_example(name)
             message = f"error: invalid arguments for {name}: {exc}"
             if example:
                 message += f"\nexample: {example}"
             return message
-        if self.repeated_tool_call(name, args):
+        if self.repeated_tool_call(name, args):#检查连续3次完全相同的调用，防止死循环
             return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
-        if tool["risky"] and not self.approve(name, args):
+        if tool["risky"] and not self.approve(name, args):#risky工具需要用户审批
             return f"error: approval denied for {name}"
         try:
             return clip(tool["run"](args))
         except Exception as exc:
             return f"error: tool {name} failed: {exc}"
 
-    def repeated_tool_call(self, name, args):
+    def repeated_tool_call(self, name, args):#你可以多次调同一个工具（比如读不同文件），也可以同名同参数调 2 次（边界放过）。只是连续 3 次完全相同才算可疑，可能是模型卡住了死循环了。
         tool_events = [item for item in self.session["history"] if item["role"] == "tool"]
         if len(tool_events) < 2:
             return False
@@ -911,13 +956,14 @@ def build_welcome(agent, model, host):
 
 def build_agent(args):
     workspace = WorkspaceContext.build(args.cwd)
-    store = SessionStore(Path(workspace.repo_root) / ".mini-coding-agent" / "sessions")
-    model = OllamaModelClient(
+    store = SessionStore(Path(workspace.repo_root) / ".mini-coding-agent" / "sessions") #json的读写管理器，会在工作区根目录下的.mini-coding-agent/sessions目录中保存会话数据
+    model = OpenRouterModelClient(
         model=args.model,
+        api_key=os.environ["OPENROUTER_API_KEY"],
         host=args.host,
         temperature=args.temperature,
         top_p=args.top_p,
-        timeout=args.ollama_timeout,
+        timeout=args.timeout,
     )
     session_id = args.resume
     if session_id == "latest":
@@ -942,16 +988,16 @@ def build_agent(args):
     )
 
 
-def build_arg_parser():
+def build_arg_parser():#封装"创建 + 配置 parser"的过程
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description="Minimal coding agent for Ollama models.",
     )
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
-    parser.add_argument("--model", default="qwen3.5:4b", help="Ollama model name.")
-    parser.add_argument("--host", default="http://127.0.0.1:11434", help="Ollama server URL.")
-    parser.add_argument("--ollama-timeout", type=int, default=300, help="Ollama request timeout in seconds.")
+    parser.add_argument("--model", default="openai/gpt-4o-mini", help="OpenRouter model name.")
+    parser.add_argument("--host", default="https://openrouter.ai", help="OpenRouter server URL.")
+    parser.add_argument("--timeout", type=int, default=60, help="API request timeout in seconds.")
     parser.add_argument("--resume", default=None, help="Session id to resume or 'latest'.")
     parser.add_argument(
         "--approval",
@@ -967,7 +1013,7 @@ def build_arg_parser():
 
 
 def main(argv=None):
-    args = build_arg_parser().parse_args(argv)
+    args = build_arg_parser().parse_args(argv)#设置参数，并解析命令行输入
     agent = build_agent(args)
 
     print(build_welcome(agent, model=args.model, host=args.host))
